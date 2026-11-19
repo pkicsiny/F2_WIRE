@@ -763,7 +763,7 @@ class MyGui(QtWidgets.QWidget):
 
             for ki in self.quad_k_array:
                 
-                print(f"[quad_scan_all] Current k1: {ki}")
+                print(f"[quad_scan_all] Initiating quad scan with k1={ki} [kG]")
 
                 #####################
                 # set quad strength #
@@ -782,9 +782,8 @@ class MyGui(QtWidgets.QWidget):
                 tol = 1e-1
                 ki_readback = quad_pv_get.get()
                 while abs(ki_readback-ki) > tol:
-                    print(f"[quad_scan_all] Current quad value: {ki_readback} [kG]")
                     ki_readback = quad_pv_get.get()
-                print(f"[quad_scan_all] Current quad value: {ki_readback} [kG]")                   
+                print(f"[quad_scan_all] Current quad value set to: {ki_readback} [kG]")                   
 
                 #####################
                 # perform wire scan #
@@ -815,9 +814,8 @@ class MyGui(QtWidgets.QWidget):
             tol = 1e-1
             ki_OG_readback = quad_pv_get.get()
             while abs(ki_OG_readback-ki_OG) > tol:
-                print(f"[quad_scan_all] Current quad value: {ki_OG_readback} [kG]")
                 ki_OG_readback = quad_pv_get.get()
-            print(f"[quad_scan_all] Current quad value: {ki_OG_readback} [kG]")                   
+            print(f"[quad_scan_all] Quad k value set to: {ki_OG_readback} [kG]")                   
 
             #######################
             # make plot of k1-rms #
@@ -853,6 +851,7 @@ class MyGui(QtWidgets.QWidget):
 
         for i, ax_key in enumerate(axes_keys):
 
+            print(f"[quad_scan_plot] plotting {ax_key} scan data...")
             rms_list = self.quad_scan_fitted_rms_dict[ax_key]
             rms_error_list = self.quad_scan_fitted_rms_error_dict[ax_key]
             assert len(rms_list) == len(rms_error_list), "rms and rms error lists have different length!"
