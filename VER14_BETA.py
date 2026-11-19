@@ -4,6 +4,8 @@ sys.path.append('/usr/local/facet/tools/python')
 sys.path.append('/usr/local/facet/tools/python/F2_pytools')
 from F2_pytools.mags import set_magnets
 from pathlib import Path
+import io
+import re
 
 # SLAC Shit
 from physicselog import submit_entry
@@ -21,7 +23,6 @@ from PyQt5.QtGui import QDoubleValidator, QIntValidator
 # Math/Numerical Shit
 import numpy as np
 import pandas as pd
-from numpy.ma.core import shape
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 import matplotlib.pyplot as plt
@@ -61,13 +62,34 @@ def find_ui_file():
     raise FileNotFoundError(f"Could not find {UI_FILENAME!r} beside this script or at " f"{UI_FALLBACK}")
 
 
+_QT6_ENUM_TAG = re.compile(r"(<(?:enum|set)>)([^<]*)(</(?:enum|set)>)")
+
+
+def load_ui_pyqt5(ui_path, widget):
+    """Load a .ui file saved by Qt6 Designer into a PyQt5 widget.
+
+    Qt6 Designer writes fully scoped enums (QFrame::Shape::StyledPanel,
+    Qt::AlignmentFlag::AlignCenter) which PyQt5's uic cannot resolve. Rewrite them
+    to the Qt5 form (QFrame::StyledPanel, Qt::AlignCenter) in memory before loading,
+    so the .ui can keep being edited in Qt6 Designer.
+    """
+    text = Path(ui_path).read_text(encoding="utf-8")
+
+    def _fix(match):
+        body = re.sub(r"\b(\w+)::\w+::(\w+)\b", r"\1::\2", match.group(2))
+        return match.group(1) + body + match.group(3)
+
+    text = _QT6_ENUM_TAG.sub(_fix, text)
+    uic.loadUi(io.StringIO(text), widget)
+
+
 ########################################################################################################################
 
 
 class MyGui(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        uic.loadUi(str(find_ui_file()), self)
+        load_ui_pyqt5(find_ui_file(), self)
 
         self.tabWidget.removeTab(self.tabWidget.indexOf(self.EmittanceMatching))
         #elf.tabWidget.removeTab(self.tabWidget.indexOf(self.AllWirePlots))
@@ -153,6 +175,7 @@ class MyGui(QtWidgets.QWidget):
         self.QuadScanXYpush.clicked.connect(lambda: self.quad_scan_all(axis="XY"))
         self.QuadScanXpush.clicked.connect( lambda: self.quad_scan_all(axis= "X"))
         self.QuadScanYpush.clicked.connect( lambda: self.quad_scan_all(axis= "Y"))
+        self.AbortPush_quad.clicked.connect(self.abort_scan)
 
         ################################################################################################################
         # Single Wire scan Tab
@@ -392,13 +415,14 @@ class MyGui(QtWidgets.QWidget):
         figure.tight_layout()
         self.SingleWirePlot_canvas.draw_idle()
 
-    def quad_singlesscan(self, axis=None, progressBar=None):
+    def quad_singlesscan(self, axis=None, progressBar=None, reset_abort=True):
 
-        ####################       
+        ####################
         # init wire object #
         ####################
- 
-        self.abort_requested = False
+
+        if reset_abort:
+            self.abort_requested = False
         axis = "X" if axis is None else axis.upper()
 
         self.axis = axis
@@ -736,93 +760,93 @@ class MyGui(QtWidgets.QWidget):
             elif self.axis == "Y":
                 ep.caput("WIRE:LI20:3179:YRMS", result["raw_rms"])
 
+    def _wait_for_quad(self, quad_pv_get, target, tol=1e-1, timeout=60.0, respect_abort=True):
+        """Wait until the quad readback [kG] is within tol of target.
+
+        Keeps the GUI responsive, gives up after `timeout` seconds instead of hanging
+        forever, and (optionally) returns early if the user hits abort.
+        """
+        start = monotonic()
+        while True:
+            readback = quad_pv_get.get()
+            if readback is not None and abs(readback - target) <= tol:
+                return readback
+            if respect_abort and self.abort_requested:
+                return readback
+            if monotonic() - start > timeout:
+                raise TimeoutError(f"Quad did not reach {target} kG within {timeout} s (last readback: {readback})")
+            QtWidgets.QApplication.processEvents()
+            sleep(0.1)
+
     def quad_scan_all(self, axis="XY"):
-
         """
-        only works for area=IP and axis="XY"
+        Scan the selected quad over self.quad_k_array and do an IP wire scan at every point.
+        The original quad setting is always restored at the end (also on abort or error).
         """
+        axis = axis.upper()
+        if axis not in ("X", "Y", "XY"):
+            raise ValueError(f"Invalid value for axis: {axis}. Has to be X, Y or XY!")
 
-        # caputre OG quad value
-        quad_pv_root = self.QuadPVDropdown.currentText()
-        quad_pv_OG_str = f"{quad_pv_root}:BDES"
-        quad_pv_OG = get_pv(quad_pv_OG_str)
-        ki_OG = quad_pv_OG.get()
-
+        # pick up whatever is currently typed in the boxes
+        self.update_quad_k_array()
         if self.quad_k_array is None:
-            raise ValueError(f"self.quad_k_array is none: {self.quad_k_array}. Set quad scan points first!")
-        else:
-            
-            # new scan: forget the results of previous scans
-            self.quad_scan_fitted_rms_dict = {}
-            self.quad_scan_fitted_rms_error_dict = {}
+            raise ValueError("self.quad_k_array is None. Set quad scan points first!")
 
+        # new scan: clear abort flag and forget the results of previous scans
+        self.abort_requested = False
+        self.quad_scan_fitted_rms_dict = {}
+        self.quad_scan_fitted_rms_error_dict = {}
+
+        quad_pv_root = self.QuadPVDropdown.currentText()
+        quad_pv_bdes = get_pv(f"{quad_pv_root}:BDES")
+        quad_pv_bact = get_pv(f"{quad_pv_root}:BACT")
+
+        # capture original quad value
+        ki_OG = quad_pv_bdes.get()
+        if ki_OG is None:
+            raise RuntimeError(f"Could not read {quad_pv_root}:BDES, not starting the quad scan.")
+
+        try:
             ######################
             # loop over k values #
             ######################
 
             for ki in self.quad_k_array:
-                
                 print(f"[quad_scan_all] Initiating quad scan with k1={ki} [kG]")
 
-                #####################
-                # set quad strength #
-                #####################
-
-                #quad_pv_set_str = f"{quad_pv_root}:BDES"
-                quad_pv_get_str = f"{quad_pv_root}:BACT"
-                #quad_pv_set = get_pv(quad_pv_set_str)
-                quad_pv_get = get_pv(quad_pv_get_str)
-
-                # set quad strength
+                # set quad strength and wait until it is there
                 set_magnets([quad_pv_root], [float(ki)])
-                #quad_pv_set.put(float(ki), wait=True) # quad strength in [kG] 
+                ki_readback = self._wait_for_quad(quad_pv_bact, float(ki))
+                if self.abort_requested:
+                    print("[quad_scan_all] aborted while waiting for quad")
+                    break
+                print(f"[quad_scan_all] Current quad value set to: {ki_readback} [kG]")
 
-                # check if properly set
-                tol = 1e-1
-                ki_readback = quad_pv_get.get()
-                while abs(ki_readback-ki) > tol:
-                    ki_readback = quad_pv_get.get()
-                print(f"[quad_scan_all] Current quad value set to: {ki_readback} [kG]")                   
-
-                #####################
-                # perform wire scan #
-                #####################
-
-                if axis=="XY":
-                    self.quad_singlesscan(axis="X", progressBar=self.progressBar_6)
-                    if not self.abort_requested:
-                        self.quad_singlesscan(axis="Y", progressBar=self.progressBar_6)
-                elif axis=="X":
-                    self.quad_singlesscan(axis="X", progressBar=self.progressBar_6)
-                elif axis=="Y":
-                    self.quad_singlesscan(axis="Y", progressBar=self.progressBar_6)
-                else:
-                    raise ValueError(f"Invalid value for axis: {axis}. Has to be X, Y or XY!")
+                # perform wire scan(s)
+                for ax in axis:
+                    self.quad_singlesscan(axis=ax, progressBar=self.progressBar_6, reset_abort=False)
+                    if self.abort_requested:
+                        break
 
                 if self.abort_requested:
                     print("[quad_scan_all] aborted, restoring quad")
                     break
 
                 print("[quad_scan_all] wire scan complete")
-
-
-            # set back OG quad value
+        finally:
+            # always put the quad back
             set_magnets([quad_pv_root], [float(ki_OG)])
+            try:
+                ki_OG_readback = self._wait_for_quad(quad_pv_bact, float(ki_OG), respect_abort=False)
+                print(f"[quad_scan_all] Quad k value restored to: {ki_OG_readback} [kG]")
+            except TimeoutError as err:
+                print(f"[quad_scan_all] WARNING: could not confirm quad restore: {err}")
 
-            # check if properly set
-            tol = 1e-1
-            ki_OG_readback = quad_pv_get.get()
-            while abs(ki_OG_readback-ki_OG) > tol:
-                ki_OG_readback = quad_pv_get.get()
-            print(f"[quad_scan_all] Quad k value set to: {ki_OG_readback} [kG]")                   
+        #######################
+        # make plot of k1-rms #
+        #######################
 
-            #######################
-            # make plot of k1-rms #
-            #######################
-                
-            self.quad_scan_plot()
-
-
+        self.quad_scan_plot()
 
     def quad_scan_plot(self):
         """Plot fitted rms vs k1 on the GUI canvas (self.QuadScanPlot_canvas).
@@ -861,7 +885,9 @@ class MyGui(QtWidgets.QWidget):
 
             # n < len(k_array) if the scan was aborted
             n = len(rms_list)
-            ax[i].errorbar(self.quad_k_array[:n], rms_list, yerr=rms_error_list, c="b", capsize=3)
+            print(f"[quad_scan_plot] {ax_key}: k={list(np.round(self.quad_k_array[:n], 4))} rms={list(np.round(rms_list, 4))}")
+            ax[i].errorbar(self.quad_k_array[:n], rms_list, yerr=rms_error_list, c="b" if ax_key == "X" else "r",
+                           marker="o", capsize=3)
 
             #################
             # plot settings #
@@ -1148,9 +1174,24 @@ class wireFunk:
         self.pv_x.put(int(self.axis == "X"), wait=True)
         self.pv_y.put(int(self.axis == "Y"), wait=True)
 
+        # Snapshot of the PMT history before the scan, to detect stale data afterwards.
+        pre_scan_history = self.pv_pmt.get(use_monitor=False)
+        pre_scan_history = np.asarray([] if pre_scan_history is None else pre_scan_history, dtype=float).reshape(-1)
+        pre_scan_history = np.nan_to_num(pre_scan_history, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Stating the Scan
         self.pv_startscan.put(1, wait=True)
         print(f"OK Now Starting {self.axis} wirescan...")
+
+        # SCANPROGRESS can still read 100 from the previous scan right after STARTSCAN.
+        # If we read that stale 100, the loop below exits at once and we would grab the
+        # PMT history of the PREVIOUS scan (e.g. the X data again for the Y scan).
+        stale_deadline = monotonic() + 3.0
+        while monotonic() < stale_deadline:
+            first_progress = self.scanstat_pv.get()
+            if first_progress is None or first_progress < 100:
+                break
+            sleep(0.05)
         
         deadline = monotonic() + self.t_out
 
@@ -1186,6 +1227,10 @@ class wireFunk:
         history = np.nan_to_num(history, nan=0.0, posinf=0.0, neginf=0.0)
         data_length = min(self.shotnum, history.size)
         PMTdata = history[-data_length:].copy() if data_length else np.zeros(0)
+
+        if data_length and pre_scan_history.size >= data_length and np.array_equal(PMTdata, pre_scan_history[-data_length:]):
+            print(f"WARNING: PMT history for the {self.axis} scan is identical to the history before the scan started. "
+                  f"This scan most likely returned stale (previous scan) data!")
 
         # Relative position [µm] = sample time [s] * scan speed [µm/s].
         # scanvel defaults to 100 µm/s; no extra 1000 or 1e6 conversion.
