@@ -143,8 +143,7 @@ class MyGui(QtWidgets.QWidget):
         #self.Yaxis_Label.hide()
 
         # quad scan frame
-        self.QuadScanPlot_figure, self.QuadScanPlot_canvas, self.QuadScanPlot_axes = make_plot_frame(
-        self.QuadScanPlot)
+        self.QuadScanPlot_figure, self.QuadScanPlot_canvas, self.QuadScanPlot_axes = make_plot_frame(self.QuadScanPlot)
 
         ################################################################################################################
         # Quad Scan Wire scan Tab
